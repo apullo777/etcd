@@ -15,6 +15,7 @@
 package cache
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -64,23 +65,16 @@ func TestPeekLatestAndOldest(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 			rb := newRingBuffer(tt.capacity)
 			for _, r := range tt.revs {
-				rb.Append(event(r, "k"))
+				rb.Append(makeEventBatch(r, "k", 1))
 			}
 
-			latestEvent := rb.PeekLatest()
-			oldestEvent := rb.PeekOldest()
+			latestRev := rb.PeekLatest()
+			oldestRev := rb.PeekOldest()
 
-			gotLatestRev := int64(0)
-			if latestEvent != nil {
-				gotLatestRev = latestEvent.Kv.ModRevision
-			}
-			gotOldestRev := int64(0)
-			if oldestEvent != nil {
-				gotOldestRev = oldestEvent.Kv.ModRevision
-			}
+			gotLatestRev := latestRev
+			gotOldestRev := oldestRev
 
 			if tt.wantLatestRev != gotLatestRev {
 				t.Fatalf("PeekLatest()=%d, want=%d", gotLatestRev, tt.wantLatestRev)
@@ -97,7 +91,7 @@ func TestFilter(t *testing.T) {
 		name             string
 		capacity         int
 		revs             []int64
-		predicate        EntryPredicate
+		minRev           int64
 		wantFilteredRevs []int64
 		wantLatestRev    int64
 	}{
@@ -105,7 +99,7 @@ func TestFilter(t *testing.T) {
 			name:             "no_filter",
 			capacity:         5,
 			revs:             []int64{1, 2, 3},
-			predicate:        AfterRev(0),
+			minRev:           0,
 			wantFilteredRevs: []int64{1, 2, 3},
 			wantLatestRev:    3,
 		},
@@ -113,7 +107,7 @@ func TestFilter(t *testing.T) {
 			name:             "partial_match",
 			capacity:         5,
 			revs:             []int64{10, 11, 12, 13},
-			predicate:        AfterRev(12),
+			minRev:           12,
 			wantFilteredRevs: []int64{12, 13},
 			wantLatestRev:    13,
 		},
@@ -121,7 +115,7 @@ func TestFilter(t *testing.T) {
 			name:             "filter_when_full",
 			capacity:         3,
 			revs:             []int64{20, 21, 22, 23, 24},
-			predicate:        AfterRev(23),
+			minRev:           23,
 			wantFilteredRevs: []int64{23, 24},
 			wantLatestRev:    24,
 		},
@@ -129,7 +123,7 @@ func TestFilter(t *testing.T) {
 			name:             "none_match",
 			capacity:         4,
 			revs:             []int64{30, 31},
-			predicate:        AfterRev(100),
+			minRev:           100,
 			wantFilteredRevs: []int64{},
 			wantLatestRev:    31,
 		},
@@ -137,7 +131,7 @@ func TestFilter(t *testing.T) {
 			name:             "nil_predicate",
 			capacity:         4,
 			revs:             []int64{1, 2, 3},
-			predicate:        nil,
+			minRev:           0,
 			wantFilteredRevs: []int64{1, 2, 3},
 			wantLatestRev:    3,
 		},
@@ -145,7 +139,7 @@ func TestFilter(t *testing.T) {
 			name:             "empty_buffer_nil_predicate",
 			capacity:         3,
 			revs:             nil,
-			predicate:        nil,
+			minRev:           0,
 			wantFilteredRevs: []int64{},
 			wantLatestRev:    0,
 		},
@@ -154,20 +148,91 @@ func TestFilter(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 			rb := newRingBuffer(tt.capacity)
 			for _, r := range tt.revs {
-				rb.Append(event(r, "k"))
+				rb.Append(makeEventBatch(r, "k", 11))
 			}
 
-			gotEvents := rb.Filter(tt.predicate)
-			gotRevs := make([]int64, len(gotEvents))
-			for i, ev := range gotEvents {
-				gotRevs[i] = ev.Kv.ModRevision
+			gotBatches := rb.Filter(tt.minRev)
+			gotRevs := make([]int64, len(gotBatches))
+			for i, b := range gotBatches {
+				gotRevs[i] = b[0].Kv.ModRevision
 			}
 
 			if diff := cmp.Diff(tt.wantFilteredRevs, gotRevs); diff != "" {
 				t.Fatalf("Filter() revisions mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAtomicOrdered(t *testing.T) {
+	tests := []struct {
+		name     string
+		capacity int
+		inputs   []struct {
+			rev  int64
+			key  string
+			size int
+		}
+		wantRev  []int64
+		wantSize []int
+	}{
+		{
+			name:     "unfiltered",
+			capacity: 5,
+			inputs: []struct {
+				rev  int64
+				key  string
+				size int
+			}{
+				{5, "a", 1},
+				{10, "b", 3},
+				{15, "c", 7},
+				{20, "d", 11},
+			},
+			wantRev:  []int64{5, 10, 15, 20},
+			wantSize: []int{1, 3, 7, 11},
+		},
+		{
+			name:     "across_wrap",
+			capacity: 3,
+			inputs: []struct {
+				rev  int64
+				key  string
+				size int
+			}{
+				{1, "a", 2},
+				{2, "b", 1},
+				{3, "c", 3},
+				{4, "d", 7},
+			},
+			wantRev:  []int64{2, 3, 4},
+			wantSize: []int{1, 3, 7},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rb := newRingBuffer(tt.capacity)
+			for _, in := range tt.inputs {
+				rb.Append(makeEventBatch(in.rev, in.key, in.size))
+			}
+
+			gotBatches := rb.Filter(0)
+			if len(gotBatches) != len(tt.wantRev) {
+				t.Fatalf("len(got) = %d, want %d", len(gotBatches), len(tt.wantRev))
+			}
+			for i, b := range gotBatches {
+				if b[0].Kv.ModRevision != tt.wantRev[i] {
+					t.Errorf("at idx %d: rev = %d, want %d", i, b[0].Kv.ModRevision, tt.wantRev[i])
+				}
+				if batchSize := len(b); batchSize != tt.wantSize[i] {
+					t.Errorf("at rev %d: events.len = %d, want %d", b[0].Kv.ModRevision, batchSize, tt.wantSize[i])
+				}
 			}
 		})
 	}
@@ -194,19 +259,14 @@ func TestRebaseHistory(t *testing.T) {
 			t.Parallel()
 			rb := newRingBuffer(4)
 			for _, r := range tt.revs {
-				rb.Append(event(r, "k"))
+				rb.Append(makeEventBatch(r, "k", 1))
 			}
 
 			rb.RebaseHistory()
 
-			oldestRev := int64(0)
-			if ev := rb.PeekOldest(); ev != nil {
-				oldestRev = ev.Kv.ModRevision
-			}
-			latestRev := int64(0)
-			if ev := rb.PeekLatest(); ev != nil {
-				latestRev = ev.Kv.ModRevision
-			}
+			oldestRev := rb.PeekOldest()
+
+			latestRev := rb.PeekLatest()
 
 			if oldestRev != 0 {
 				t.Fatalf("PeekOldest()=%d, want=%d", oldestRev, 0)
@@ -215,19 +275,26 @@ func TestRebaseHistory(t *testing.T) {
 				t.Fatalf("PeekLatest()=%d, want=%d", latestRev, 0)
 			}
 
-			events := rb.Filter(nil)
-			if len(events) != 0 {
-				t.Fatalf("Filter() len(events)=%d, want=%d", len(events), 0)
+			batches := rb.Filter(0)
+			if len(batches) != 0 {
+				t.Fatalf("Filter() len(events)=%d, want=%d", len(batches), 0)
 			}
 		})
 	}
 }
 
-func event(rev int64, key string) *clientv3.Event {
-	return &clientv3.Event{
-		Kv: &mvccpb.KeyValue{
-			Key:         []byte(key),
-			ModRevision: rev,
-		},
+func makeEventBatch(rev int64, key string, batchSize int) []*clientv3.Event {
+	if batchSize <= 0 {
+		batchSize = 1
 	}
+	events := make([]*clientv3.Event, batchSize)
+	for i := range events {
+		events[i] = &clientv3.Event{
+			Kv: &mvccpb.KeyValue{
+				Key:         []byte(fmt.Sprintf("%s-%d", key, i)),
+				ModRevision: rev,
+			},
+		}
+	}
+	return events
 }

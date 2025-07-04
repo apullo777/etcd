@@ -67,21 +67,17 @@ func (d *demux) Register(w *watcher, startingRev int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	latestEvent := d.history.PeekLatest()
+	latestRev := d.history.PeekLatest()
 
 	// Special case: 0 means “newest”.
 	if startingRev == 0 {
-		if latestEvent == nil {
+		if latestRev == 0 {
 			d.activeWatchers[w] = 0
 			return
 		}
-		startingRev = latestEvent.Kv.ModRevision + 1
+		startingRev = latestRev + 1
 	}
 
-	var latestRev int64
-	if latestEvent != nil {
-		latestRev = latestEvent.Kv.ModRevision
-	}
 	if startingRev <= latestRev {
 		d.laggingWatchers[w] = startingRev
 	} else {
@@ -99,20 +95,21 @@ func (d *demux) Unregister(w *watcher) {
 	w.Stop()
 }
 
-func (d *demux) Broadcast(event *clientv3.Event) {
+func (d *demux) Broadcast(eventBatch []*clientv3.Event) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.history.Append(event)
+	rev := eventBatch[0].Kv.ModRevision
+	d.history.Append(eventBatch)
 	for w, nextRev := range d.activeWatchers {
-		if event.Kv.ModRevision < nextRev {
+		if rev < nextRev {
 			continue
 		}
-		if !w.enqueueEvent(event) { // buffer overflow
+		if !w.enqueueEvent(eventBatch) { // buffer overflow
 			d.laggingWatchers[w] = nextRev
 			delete(d.activeWatchers, w)
 		} else {
-			d.activeWatchers[w] = event.Kv.ModRevision + 1
+			d.activeWatchers[w] = rev + 1
 		}
 	}
 }
@@ -137,10 +134,7 @@ func (d *demux) resyncLaggingWatchers() {
 	defer d.mu.Unlock()
 
 	for w, nextRev := range d.laggingWatchers {
-		var oldestRev int64
-		if oldestEvent := d.history.PeekOldest(); oldestEvent != nil {
-			oldestRev = oldestEvent.Kv.ModRevision
-		}
+		oldestRev := d.history.PeekOldest()
 
 		if oldestRev != 0 && nextRev < oldestRev {
 			w.Stop()
@@ -148,16 +142,18 @@ func (d *demux) resyncLaggingWatchers() {
 			continue
 		}
 		// TODO: re-enable key‐predicate in Filter when non‐zero startRev or performance tuning is needed
-		missedEvents := d.history.Filter(AfterRev(nextRev))
+		missed := d.history.Filter(nextRev)
 
-		for _, event := range missedEvents {
-			if !w.enqueueEvent(event) { // buffer overflow: watcher still lagging
+		enqueueFailed := false
+		for _, eventBatch := range missed {
+			if !w.enqueueEvent(eventBatch) { // buffer overflow: watcher still lagging
+				enqueueFailed = true
 				break
 			}
-			nextRev = event.Kv.ModRevision + 1
+			nextRev = eventBatch[0].Kv.ModRevision + 1
 		}
 
-		if len(missedEvents) > 0 && nextRev > missedEvents[len(missedEvents)-1].Kv.ModRevision {
+		if !enqueueFailed && nextRev > missed[len(missed)-1][0].Kv.ModRevision {
 			delete(d.laggingWatchers, w)
 			d.activeWatchers[w] = nextRev
 		} else {
@@ -166,7 +162,7 @@ func (d *demux) resyncLaggingWatchers() {
 	}
 }
 
-func (d *demux) PeekOldest() *clientv3.Event {
+func (d *demux) PeekOldest() int64 {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.history.PeekOldest()

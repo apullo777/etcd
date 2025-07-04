@@ -109,10 +109,7 @@ func (c *Cache) Watch(ctx context.Context, key string, opts ...clientv3.OpOption
 		// terminal error → one-shot reply, needs a single buffer slot
 		responseChan := make(chan clientv3.WatchResponse, 1)
 		if errors.Is(err, rpctypes.ErrCompacted) {
-			var compactRev int64
-			if oldestEvent := c.demux.PeekOldest(); oldestEvent != nil {
-				compactRev = oldestEvent.Kv.ModRevision
-			}
+			compactRev := c.demux.PeekOldest()
 			responseChan <- clientv3.WatchResponse{CompactRevision: compactRev}
 		} else {
 			responseChan <- clientv3.WatchResponse{Canceled: true}
@@ -129,11 +126,11 @@ func (c *Cache) Watch(ctx context.Context, key string, opts ...clientv3.OpOption
 		defer cancel()
 		defer close(responseChan)
 
-		for event := range stream {
+		for eventBatch := range stream {
 			select {
 			case <-ctx.Done():
 				return
-			case responseChan <- clientv3.WatchResponse{Events: []*clientv3.Event{event}}:
+			case responseChan <- clientv3.WatchResponse{Events: eventBatch}:
 			}
 		}
 	}()
@@ -173,7 +170,7 @@ func (c *Cache) newWatchEventStream(
 	key string,
 	startRev int64,
 	opts []clientv3.OpOption,
-) (<-chan *clientv3.Event, *watcher, error) {
+) (<-chan []*clientv3.Event, *watcher, error) {
 	// TODO: Support watch on subprefix and single key & arbitrary startRev support once we guarantee gap-free replay.
 	if key != c.prefix || !clientv3.IsOptsWithPrefix(opts) || startRev != 0 {
 		return nil, nil, ErrUnsupportedWatch
@@ -200,9 +197,9 @@ func serveWatchEvents(ctx context.Context, watchCtx *watchCtx) {
 			clientv3.WithProgressNotify(),
 			clientv3.WithCreatedNotify(),
 		}
-		if oldestEvent := watchCtx.cache.demux.PeekOldest(); oldestEvent != nil {
+		if oldestRev := watchCtx.cache.demux.PeekOldest(); oldestRev != 0 {
 			opts = append(opts,
-				clientv3.WithRev(oldestEvent.Kv.ModRevision+1))
+				clientv3.WithRev(oldestRev+1))
 		}
 		watchCh := watchCtx.cache.watcher.Watch(ctx, watchCtx.cache.prefix, opts...)
 
@@ -243,8 +240,26 @@ func readWatchChannel(
 			}
 			return err
 		}
+
+		var (
+			eventBatch []*clientv3.Event
+			batchRev   int64
+		)
 		for _, event := range resp.Events {
-			demux.Broadcast(event)
+			rev := event.Kv.ModRevision
+			if len(eventBatch) == 0 {
+				batchRev = rev
+			}
+			if rev != batchRev {
+				demux.Broadcast(eventBatch)
+				eventBatch = eventBatch[:0]
+				batchRev = rev
+			}
+			eventBatch = append(eventBatch, event)
+		}
+
+		if len(eventBatch) > 0 {
+			demux.Broadcast(eventBatch)
 		}
 	}
 	return nil
