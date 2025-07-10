@@ -14,6 +14,8 @@
 
 package cache
 
+import "bytes"
+
 type Prefix string
 
 func (prefix Prefix) Match(key []byte) bool {
@@ -22,4 +24,17 @@ func (prefix Prefix) Match(key []byte) bool {
 	}
 	prefixLen := len(prefix)
 	return len(key) >= prefixLen && string(key[:prefixLen]) == string(prefix)
+}
+
+func rangePred(start, end []byte) func(k []byte) bool {
+	return func(k []byte) bool {
+		if bytes.Compare(k, start) < 0 {
+			return false
+		}
+		// no end, or the sentinel {0}  => accept everything ≥ start
+		if len(end) == 0 || (len(end) == 1 && end[0] == 0) {
+			return true
+		}
+		return bytes.Compare(k, end) < 0
+	}
 }

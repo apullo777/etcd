@@ -15,10 +15,10 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -102,19 +102,13 @@ func (c *Cache) Watch(ctx context.Context, key string, opts ...clientv3.OpOption
 		return emptyWatchChan
 	}
 
-	op := clientv3.OpGet(key, opts...)
-	startRev := op.Rev()
-
-	// TODO: Support watch on subprefix and single key & arbitrary startRev support once we guarantee gap-free replay.
-	if key != c.prefix || !clientv3.IsOptsWithPrefix(opts) || startRev != 0 {
-		responseChan := make(chan clientv3.WatchResponse, 1)
-		responseChan <- clientv3.WatchResponse{Canceled: true}
-		close(responseChan)
-		return responseChan
+	cancelChan, pred := c.validateWatch(key, opts...)
+	if cancelChan != nil {
+		return cancelChan
 	}
 
-	w := newWatcher(c.cfg.PerWatcherBufferSize, func(k []byte) bool { return strings.HasPrefix(string(k), key) })
-	c.demux.Register(w, startRev)
+	w := newWatcher(c.cfg.PerWatcherBufferSize, pred)
+	c.demux.Register(w, 0)
 
 	responseChan := make(chan clientv3.WatchResponse)
 	c.waitGroup.Add(1)
@@ -122,6 +116,7 @@ func (c *Cache) Watch(ctx context.Context, key string, opts ...clientv3.OpOption
 		defer c.waitGroup.Done()
 		defer close(responseChan)
 		defer c.demux.Unregister(w)
+		responseChan <- clientv3.WatchResponse{Created: true}
 		for {
 			select {
 			case <-ctx.Done():
@@ -175,7 +170,7 @@ func serveWatchEvents(ctx context.Context, watchCtx *watchCtx) {
 	backoff := watchCtx.backoffStart
 	for {
 		opts := []clientv3.OpOption{
-			clientv3.WithPrefix(),
+			clientv3.WithFromKey(),
 			clientv3.WithProgressNotify(),
 			clientv3.WithCreatedNotify(),
 		}
@@ -225,4 +220,30 @@ func readWatchChannel(
 		demux.Broadcast(resp.Events)
 	}
 	return nil
+}
+
+func (c *Cache) validateWatch(key string, opts ...clientv3.OpOption) (cancelChan clientv3.WatchChan, pred KeyPredicate) {
+	op := clientv3.OpGet(key, opts...)
+	startRev := op.Rev()
+	// TODO: Support watch on arbitrary startRev support once we guarantee gap-free replay.
+	if startRev != 0 {
+		ch := make(chan clientv3.WatchResponse, 1)
+		ch <- clientv3.WatchResponse{Canceled: true}
+		close(ch)
+		return ch, nil
+	}
+
+	startKey := []byte(key)
+	endKey := op.RangeBytes() // nil = single key, {0}=FromKey, else explicit range
+	openEnd := len(endKey) == 1 && endKey[0] == 0
+
+	switch {
+	case len(endKey) == 0:
+		pred = func(k []byte) bool { return bytes.Equal(k, startKey) }
+	case openEnd:
+		pred = func(k []byte) bool { return bytes.Compare(k, startKey) >= 0 }
+	default:
+		pred = rangePred(startKey, endKey)
+	}
+	return nil, pred
 }
